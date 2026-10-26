@@ -30,6 +30,7 @@ class Onvif extends utils.Adapter {
     this.on('message', this.onMessage.bind(this));
     this.deviceArrayManualSearch = [];
     this.deviceNatives = {};
+    this.snapshotRequests = new WeakMap();
     this.devices = {};
     this.discoveredDevices = [];
     this.json2iob = new Json2iob(this);
@@ -87,12 +88,17 @@ class Onvif extends utils.Adapter {
           const networkErrors = ['EHOSTUNREACH', 'ECONNREFUSED', 'ETIMEDOUT', 'ENETUNREACH'];
 
           if (networkErrors.includes(code)) {
-            this.log.warn(`Device ${device.native.ip}:${device.native.port} is unreachable (${code})`);
+            this.log.warn(
+              `Device ${device.native.ip}:${device.native.port} is unreachable (${code})`,
+            );
           } else {
-            this.log.error(`Error initializing device ${device.native.ip}:${device.native.port}: ${err}`);
+            this.log.error(
+              `Error initializing device ${device.native.ip}:${device.native.port}: ${err}`,
+            );
             this.log.debug(`Data: ${error?.data} XML: ${error?.xml}`);
             this.log.debug(err?.stack || String(err));
           }
+
           return null;
         });
       if (camObj) {
@@ -416,8 +422,8 @@ class Onvif extends utils.Adapter {
           return;
         }
         const scopeObject = { name: '', hardware: '' };
-        let xaddrs = '';
-        let urn = '';
+        let xaddrs;
+        let urn;
 
         try {
           const probeMatch = result['Envelope']['Body'][0]['ProbeMatches'][0]['ProbeMatch'][0];
@@ -429,7 +435,9 @@ class Onvif extends utils.Adapter {
           const scopesPayload = probeMatch['Scopes']?.[0]?.payload || '';
 
           const isOnvifDevice =
-            /NetworkVideoTransmitter/i.test(types) || /onvif/i.test(xaddrs) || /onvif/i.test(scopesPayload);
+            /NetworkVideoTransmitter/i.test(types) ||
+            /onvif/i.test(xaddrs) ||
+            /onvif/i.test(scopesPayload);
 
           if (!isOnvifDevice) {
             this.log.debug(
@@ -860,13 +868,46 @@ class Onvif extends utils.Adapter {
       this.log.error('No native found for cam ' + id + ' cannot get snapshot');
       return;
     }
-    //check last snapshot was more than 5 seconds ago
-    if (native.lastSnapshot && native.lastSnapshot + 500 > Date.now()) {
-      this.log.debug('Last snapshot was less than 0.5 seconds ago. Skip snapshot');
-      return;
+    // Share in-flight work and reuse successful snapshots only within the original
+    // 500 ms window. Age starts at request time, not completion, so slow requests
+    // do not extend the cache lifetime. Replaced camera configuration gets a new key.
+    const cached = this.snapshotRequests.get(native);
+    if (cached && cached.useHighRes === this.config.useHighRes) {
+      if (cached.pending || Date.now() - cached.startedAt < 500) {
+        return cached.promise;
+      }
     }
-    this.deviceNatives[id].lastSnapshot = Date.now();
+    const entry = {
+      useHighRes: this.config.useHighRes,
+      startedAt: Date.now(),
+      pending: true,
+      promise: /** @type {Promise<Buffer | undefined> | null} */ (null),
+    };
+    entry.promise = Promise.resolve()
+      .then(() => this.fetchSnapshot(id, native))
+      .then((image) => {
+        if (!Buffer.isBuffer(image) || image.length === 0) {
+          if (this.snapshotRequests.get(native) === entry) {
+            this.snapshotRequests.delete(native);
+          }
+          return;
+        }
+        return image;
+      })
+      .catch((error) => {
+        if (this.snapshotRequests.get(native) === entry) {
+          this.snapshotRequests.delete(native);
+        }
+        throw error;
+      })
+      .finally(() => {
+        entry.pending = false;
+      });
+    this.snapshotRequests.set(native, entry);
+    return entry.promise;
+  }
 
+  async fetchSnapshot(id, native) {
     if (!native || !native.snapshotUrl || this.config.useHighRes) {
       this.log.debug('No snapshot url found for ' + id + ' try ffmpeg as fallback');
       if (!this.ffmpeg) {
@@ -888,17 +929,31 @@ class Onvif extends utils.Adapter {
           .inputOptions(['-rtsp_transport tcp'])
           .addOptions(['-f', 'image2', '-vframes', '1'])
           .on('error', (err) => {
+            this.clearTimeout(timer);
             this.log.error('An ffmpeg error occurred: ' + err.message);
             reject(err);
           })
-          .on('end', () => {});
+          .on('end', () => {
+            this.clearTimeout(timer);
+          });
+
+        const timer = this.setTimeout(() => {
+          reject(new Error('Snapshot ffmpeg timeout for ' + id));
+          command.kill('SIGKILL');
+        }, 15000);
 
         const ffstream = command.pipe();
         const buffers = [];
         ffstream.on('data', (chunk) => {
           buffers.push(chunk);
         });
+        ffstream.on('error', (error) => {
+          this.clearTimeout(timer);
+          reject(error);
+          command.kill('SIGKILL');
+        });
         ffstream.on('end', async () => {
+          this.clearTimeout(timer);
           const buffer = Buffer.concat(buffers);
           resolve(buffer);
         });
@@ -917,6 +972,7 @@ class Onvif extends utils.Adapter {
             return await request(snapshotUrl, {
               method: 'GET',
               digestAuth: `${native.user}:${native.password}`,
+              timeout: 7000,
             })
               .then((response) => {
                 if (response.status >= 400) {
